@@ -1,0 +1,891 @@
+Carbon-Share logic notes
+========================
+
+Scope
+-----
+This file explains the runtime logic of the Python source files in `Code/`:
+
+- `Share.py`
+- `server.py`
+- `directShare.py`
+- `data.py`
+- `bridge.py`
+
+It focuses on:
+
+- module-level variables
+- class attributes
+- each function and method
+- how data moves between modules
+
+
+1. High-level architecture
+--------------------------
+
+Carbon-Share is split into three main layers:
+
+1. `data.py`
+   Holds shared configuration and helper functions. It also computes machine-specific values like the active URL and hostname.
+
+2. `server.py`
+   Runs a Flask app that exposes routes for login, browsing files, downloads, uploads, clipboard writes, and deletion.
+
+3. `directShare.py`
+   Runs a GTK desktop window that shows the current share URL and a QR code.
+
+`Share.py` ties these together. It launches:
+
+- one background thread for IP monitoring
+- one background thread for the Flask server
+- one foreground GTK event loop
+
+`bridge.py` is a simple import bridge that exposes the `data` module as `data_module`. It exists to avoid circular imports.
+
+
+2. Cross-module flow
+--------------------
+
+Startup flow:
+
+1. `Code/Share.py` is executed.
+2. `App.__init__()` creates `directShare.App()`.
+3. `App.start()` launches:
+   - `monitor_ip()` in a daemon thread
+   - `server.init_server` in a daemon thread
+4. The GTK app runs in the main thread.
+5. `data.url` is the canonical current share URL.
+6. When `monitor_ip()` sees a different URL, it:
+   - updates `data.previousIP`
+   - updates `data.url`
+   - tells the GTK app to redraw the label and QR code
+
+Request flow:
+
+1. A client opens `http://<host-ip>:5000/`.
+2. Flask serves `login.html` if the session is not authenticated.
+3. `/login` checks credentials with PAM through `data.verifyPass()`.
+4. When login succeeds, Flask stores `session["key"]`.
+5. Other routes become available because `check_session()` now allows them.
+6. File routes call helper functions like `get_files()`, `safe_delete()`, `goBack()`, and `write_clipboard()`.
+
+
+3. `Code/bridge.py`
+-------------------
+
+Purpose:
+Expose the `data` module through an intermediate module so that other modules can import shared state without creating an import loop.
+
+Variables:
+
+- `data_module`
+  Value: the imported `data` module object.
+  Used by:
+  - `directShare.py`
+  - `server.py`
+
+Function list:
+
+- none
+
+
+4. `Code/data.py`
+-----------------
+
+Purpose:
+Store shared globals and helper functions used by both the GTK app and the Flask server.
+
+Module-level constants and variables:
+
+- `PORT = 5000`
+  The TCP port used for the Flask server and for generated URLs.
+
+- `RED = "\033[91m"`
+  ANSI terminal color code used in error logs.
+
+- `GREEN = "\033[92m"`
+  ANSI terminal color code used in success logs.
+
+- `RESET = "\033[0m"`
+  ANSI terminal color reset sequence.
+
+- `NAME = "Carbon-Share"`
+  Printed in log messages as the application name.
+
+- `path = str(Path.home()) if Path.home() else "/home"`
+  Default filesystem path shown in the file browser template.
+  Usually the current user's home directory.
+
+- `name = platform.node()`
+  The machine hostname. Returned by the `/about` route.
+
+- `status = False`
+  A shared state flag. In the current codebase it is defined but not used.
+
+- `color = "#BEBEBE"`
+  Background color used when generating the QR image in `directShare.getQR()`.
+
+- `password = getPass()`
+  A saved value loaded from `share.json`.
+  Read at import time.
+  In the current codebase it is not used for Flask login, which relies on PAM instead.
+
+- `url = check()`
+  Current share URL, computed at import time using the detected machine IP and `PORT`.
+  Example: `http://192.168.1.5:5000/`
+
+- `previousIP = ""`
+  Previous URL value tracked by `Share.monitor_ip()`.
+  Used for change detection.
+
+- `abouturl = f"{url}About-Share"`
+  Derived informational URL string.
+  Defined but not used elsewhere in the current repository.
+
+Functions:
+
+- `show_error_log(text)`
+  Input:
+  - `text`: message string to print.
+  Behavior:
+  - prints a formatted error log line to stdout with ANSI colors.
+  Side effects:
+  - terminal output only.
+
+- `show_success_log(text)`
+  Input:
+  - `text`: message string to print.
+  Behavior:
+  - prints a formatted success log line to stdout with ANSI colors.
+  Side effects:
+  - terminal output only.
+
+- `getPass()`
+  Input:
+  - none
+  Behavior:
+  - tries to open `share.json`
+  - returns the value stored under the `"session"` key
+  - returns `None` if the file is missing or malformed
+  Side effects:
+  - filesystem read
+  Notes:
+  - this is executed during module import to initialize `password`.
+
+- `getPAIRS()`
+  Input:
+  - none
+  Behavior:
+  - tries to open `share.json`
+  - returns the value stored under `"PAIRS"`
+  - returns an empty list on failure
+  Side effects:
+  - filesystem read
+  Notes:
+  - pairing support is mostly inactive in this repository.
+
+- `addPAIR(nam)`
+  Input:
+  - `nam`: a device or user name intended for pairing.
+  Behavior:
+  - immediately returns before doing any work
+  - the remaining code is dead code in the current implementation
+  Intended logic in unreachable code:
+  - normalize the input name
+  - add it to `ALLOWED`
+  - write updated pairing data to `share.json`
+  Notes:
+  - `ALLOWED` is not defined in this file
+  - because of the early `return`, this function has no effect
+
+- `popup(header='Share', text='Hello There!')`
+  Inputs:
+  - `header`: notification title
+  - `text`: notification body
+  Behavior:
+  - runs `notify-send` with a 2-second timeout
+  Side effects:
+  - desktop notification
+
+- `savePass(key)`
+  Input:
+  - `key`: value to store under `"session"` in `share.json`
+  Behavior:
+  - writes a JSON object containing:
+    - `"session": key`
+    - `"PAIRS": []`
+  - then tries to clear and update `session`
+  - then updates the module-global `password`
+  Side effects:
+  - filesystem write
+  Intended side effects:
+  - update session state
+  Notes:
+  - `session` is referenced but not imported from Flask in this module
+  - because that code sits inside the `try`, failures return `None`
+  - this function is incomplete in the current repo
+
+- `check()`
+  Input:
+  - none
+  Behavior:
+  - creates a UDP socket
+  - connects to `8.8.8.8:80` only to discover the machine's outbound local IP
+  - reads the local socket address
+  - if detection fails, falls back to `127.0.0.1`
+  - returns `http://<detected-ip>:5000/`
+  Side effects:
+  - socket creation and close
+  Notes:
+  - no actual payload is sent to Google DNS; the socket connect is used to infer the interface IP
+
+- `verifyPass(name, key)`
+  Inputs:
+  - `name`: username submitted from the login form
+  - `key`: password submitted from the login form
+  Behavior:
+  - calls `pam.authenticate(name, key)`
+  - returns `True` or `False`
+  Error handling:
+  - on exception, logs an error and returns `False`
+  Side effects:
+  - PAM authentication attempt against the local system
+
+
+5. `Code/directShare.py`
+------------------------
+
+Purpose:
+Build and run the GTK window that displays the current server URL and its QR code.
+
+Imports:
+
+- `gi`, `Gtk`, `Gdk`, `GdkPixbuf`, `GLib`
+  GTK UI and rendering
+- `qrcode`, `io`
+  QR code generation and in-memory PNG handling
+- `bridge`
+  access to shared state
+- `os`
+  hard exit on stop
+
+Module variable:
+
+- `data = bridge.data_module`
+  Alias to the shared `data` module. Used throughout the class.
+
+Class:
+
+- `App`
+  Encapsulates the GTK window and its controls.
+
+Methods and attributes:
+
+- `__init__(self)`
+  Purpose:
+  - build the window and widgets
+  Attributes created:
+  - `self.main`
+    GTK top-level window titled `Carbon-Share`.
+  - `self.css`
+    Byte string containing inline CSS rules for buttons and visual styling.
+  - `self.image`
+    GTK image widget that will hold the QR code pixbuf.
+  - `self.label`
+    GTK button that displays the current server URL.
+  Local variables:
+  - `box`
+    Horizontal container added to the window.
+  - `boxVertical`
+    Vertical container holding the QR image and URL button.
+  - `styler`
+    `Gtk.CssProvider` used to apply `self.css`.
+  Signals connected:
+  - window `destroy` -> `self.stop`
+  - window `key-press-event` -> `self.on_key`
+  - label button `clicked` -> `self.open_browser`
+  Behavior:
+  - creates the UI
+  - applies CSS
+  - shows the window
+
+- `on_key(self, widget, event)`
+  Inputs:
+  - `widget`: GTK widget that received the signal
+  - `event`: key event object
+  Behavior:
+  - checks if the event is a key press
+  - if the pressed key is `q`, it stops the app
+  Return:
+  - `True` when it handles `q`
+  - otherwise implicit `None`
+
+- `open_browser(self, widget)`
+  Input:
+  - `widget`: clicked widget
+  Behavior:
+  - checks whether `data.url` exists
+  - imports `webbrowser`
+  - opens the current URL in the default browser
+  Return:
+  - always returns `None`
+
+- `run(self)`
+  Input:
+  - none
+  Behavior:
+  - starts the GTK main event loop with `Gtk.main()`
+  Side effects:
+  - blocks the main thread until the app exits
+
+- `getQR(self, url)`
+  Input:
+  - `url`: string to encode in the QR code
+  Local variables:
+  - `qr`
+    `qrcode.QRCode` instance configured with `box_size=6`, `border=4`
+  - `img`
+    generated QR image with black foreground and `data.color` background
+  - `buf`
+    in-memory `BytesIO` buffer storing the PNG image
+  - `loader`
+    GTK pixbuf loader for PNG data
+  Behavior:
+  - builds a QR code from the URL
+  - renders it to PNG in memory
+  - loads it into a GTK pixbuf
+  Return:
+  - pixbuf object for the GTK image widget
+
+- `updateIP(self, url)`
+  Input:
+  - `url`: new server URL string
+  Behavior:
+  - schedules a GTK-safe update of:
+    - `self.label` text
+    - `self.image` pixbuf
+  Mechanism:
+  - uses `GLib.idle_add()` so updates happen on the GTK main loop thread
+
+- `stop(self, widget)`
+  Input:
+  - `widget`: signal source, not used
+  Behavior:
+  - terminates the process immediately with `os._exit(1)`
+  Notes:
+  - this is a hard exit, not a graceful shutdown
+
+- `isLocal(self)`
+  Input:
+  - none
+  Behavior:
+  - checks whether `data.url` appears to point at loopback `127.0.0.1`
+  - if yes, shows a notification that device discovery is unavailable
+  Return:
+  - `True` when the URL is local-only
+  - `False` otherwise
+  Notes:
+  - this method is defined but not used elsewhere in the current repo
+
+
+6. `Code/server.py`
+-------------------
+
+Purpose:
+Expose HTTP endpoints for authentication, directory browsing, file transfer, deletion, metadata lookup, and clipboard integration.
+
+Module-level variables:
+
+- `data = bridge.data_module`
+  Shared reference to `data.py`.
+
+- `password = data.getPass()`
+  Saved session value loaded from `share.json`.
+  Defined at import time.
+  Not used by current route logic.
+
+- `server = Flask(__name__, template_folder="Templates", static_folder="static")`
+  Flask application instance.
+
+- `server.secret_key = "com.carbon.share"`
+  Secret key used by Flask sessions.
+
+- `FILE_ICONS = {...}`
+  Maps file extensions to Font Awesome CSS classes.
+  Used by:
+  - `getLogo()`
+  - `get_files()`
+  - `/url/<path>`
+
+Flask hooks and routes:
+
+- `check_session()`
+  Decorator type:
+  - `@server.before_request`
+  Inputs:
+  - implicit Flask request context
+  Behavior:
+  - returns early if `request.endpoint` is `None`
+  - allows unauthenticated access only to:
+    - `index`
+    - `login_route`
+    - `static`
+  - if no session key is present for other endpoints:
+    - triggers a desktop warning notification
+    - returns HTTP 403 JSON error
+  Side effects:
+  - notification popup on unauthorized access attempts
+
+- `index()`
+  Route:
+  - `GET /`
+  Behavior:
+  - if not logged in, renders `login.html`
+  - if logged in, renders `greet.html` with `data=data.path`
+  Notes:
+  - `data.path` is the starting directory shown in the UI
+
+- `logout()`
+  Route:
+  - `GET|POST /logout`
+  Behavior:
+  - clears the Flask session
+  Return:
+  - JSON value `200`
+
+- `getUrl(path_)`
+  Route:
+  - `GET /url/<path:path_>`
+  Input:
+  - `path_`: URL path segment representing a filesystem path
+  Local variables:
+  - `path`
+    normalized absolute path made by prefixing `/`
+  Behavior:
+  - if the path is a file:
+    - returns JSON list:
+      - icon class
+      - `/media` URL for the file
+      - file basename
+  Return:
+  - file metadata list
+  - or `404` JSON value
+
+- `login_route()`
+  Route:
+  - `POST /login`
+  Input:
+  - JSON body expected to contain:
+    - `username`
+    - `key`
+  Local variables:
+  - `user`
+    parsed JSON body
+  - `username`
+    extracted username
+  - `userpass`
+    extracted password
+  Behavior:
+  - authenticates through `data.verifyPass(username, userpass)`
+  - if valid:
+    - writes `session["key"] = userpass`
+    - returns JSON `200`
+  Return:
+  - JSON `200` on success
+  - JSON `404` on failure
+  Notes:
+  - the session stores the password string itself, which is functional but not ideal from a security perspective
+
+- `about()`
+  Route:
+  - `GET /about`
+  Behavior:
+  - returns JSON with the machine name
+  Return:
+  - `{"bio": data.name}`
+
+- `action(command)`
+  Route:
+  - `GET /action/<command>`
+  Input:
+  - `command`: string from the URL
+  Behavior:
+  - calls `takeAction(command)`
+  Return:
+  - JSON wrapping the result
+  Supported commands:
+  - `lock`
+  - `off`
+
+- `back(path_)`
+  Route:
+  - `GET /back/<path:path_>`
+  Input:
+  - `path_`: current directory path
+  Local variables:
+  - `path`
+    absolute path normalized with a leading slash
+  Behavior:
+  - returns the parent directory listing by calling `goBack(path)`
+
+- `list_files(path_)`
+  Route:
+  - `GET /files/<path:path_>`
+  Input:
+  - `path_`: directory path
+  Local variables:
+  - `abs_path`
+    normalized absolute path
+  Behavior:
+  - lists visible entries in the requested directory via `get_files(abs_path)`
+  Return:
+  - JSON array of file entries
+
+- `serve_media(path_)`
+  Route:
+  - `GET /media/<path:path_>`
+  Input:
+  - `path_`: file path
+  Local variables:
+  - `abs_path`
+    normalized absolute path
+  Behavior:
+  - serves the file inline with `send_file(..., as_attachment=False)`
+
+- `download_file(path_)`
+  Route:
+  - `GET /download/<path:path_>`
+  Input:
+  - `path_`: file path
+  Local variables:
+  - `abs_path`
+    normalized absolute path
+  - `dir`
+    file parent directory
+  - `name`
+    file basename
+  Behavior:
+  - if the target exists and is a file, serves it as a download
+  Return:
+  - Flask download response
+  - or JSON `{"response":404}`
+
+- `upload_files()`
+  Route:
+  - `POST|GET|OPTIONS /upload`
+  Inputs:
+  - multipart form data:
+    - `files[]`: uploaded file list
+    - `path`: destination directory
+  Local variables:
+  - `files`
+    uploaded file objects
+  - `dest`
+    destination filesystem path
+  Behavior:
+  - on `OPTIONS`, returns empty `200`
+  - otherwise saves each uploaded file into `dest`
+  - shows a desktop popup naming the destination
+  Return:
+  - JSON `"200"` with HTTP status 200
+  Notes:
+  - there is no extra path validation here; the client controls `dest`
+
+- `delete_file(path_)`
+  Route:
+  - `GET /delete/<path:path_>`
+  Input:
+  - `path_`: target file path
+  Local variables:
+  - `abs_path`
+    normalized absolute path
+  Behavior:
+  - deletes by sending the file to trash via `safe_delete(abs_path)`
+
+- `copy_clipboard()`
+  Route:
+  - `POST /clipboard/copy`
+  Input:
+  - JSON body with key `data`
+  Local variables:
+  - `payload`
+    parsed JSON body
+  - `text`
+    base64-decoded UTF-8 string
+  Behavior:
+  - decodes the text and writes it to the host clipboard
+  Return:
+  - JSON result from `write_clipboard()`
+
+Helper functions:
+
+- `goBack(data)`
+  Input:
+  - `data`: current path string
+  Local variables:
+  - `pata`
+    list of path components from `data.split("/")`
+  - `nata`
+    parent path reconstructed with `"/".join(pata)`
+  - `file`
+    result of `get_files(nata)`
+  Behavior:
+  - removes the last path segment
+  - lists the parent directory
+  Return:
+  - `404` if listing failed
+  - otherwise:
+    - `{"data": <file-list>, "path": <parent-path>}`
+  Notes:
+  - variable names `pata`, `nata`, and `file` are functional but not descriptive
+
+- `getLogo(name)`
+  Input:
+  - `name`: filename string
+  Local variables:
+  - `process`
+    filename split on `.`
+  - `file`
+    last split token, treated as extension
+  Behavior:
+  - returns `None` for hidden names starting with `.`
+  - otherwise maps extension to an icon class
+  Return:
+  - icon class string
+  - or default `"fas fa-file"`
+
+- `get_files(path)`
+  Input:
+  - `path`: target directory path
+  Local variables:
+  - `entries`
+    raw result of `os.listdir(path)`
+  - `output`
+    final list returned to the client
+  - `entry`
+    each filename inside the directory
+  - `abs_entry`
+    full path of each entry
+  - `icon`
+    icon class chosen for a non-directory file
+  Behavior:
+  - lists a directory
+  - skips hidden names beginning with `.`
+  - appends:
+    - `["folder", entry]` for directories
+    - `[icon, entry]` for files
+  - sorts the final list
+  Return:
+  - `[]` if the directory is empty
+  - sorted list of visible items on success
+  - string `"404"` on exception
+  Notes:
+  - this function returns string `"404"`, not integer `404`
+
+- `safe_delete(path)`
+  Input:
+  - `path`: file or directory to trash
+  Local variables:
+  - `parent`
+    parent directory of `path`
+  Behavior:
+  - runs `gio trash <path>`
+  - lists the parent directory again
+  Return:
+  - `{"data": get_files(parent), "path": parent}` on success
+  - string `"400"` on failure
+
+- `write_clipboard(data_text)`
+  Input:
+  - `data_text`: string to place into the clipboard
+  Behavior:
+  - runs `xclip -selection clipboard`
+  - writes the text to stdin of the process
+  Return:
+  - `200` on success
+  - `400` on failure
+
+- `takeAction(command)`
+  Input:
+  - `command`: action keyword from the `/action/<command>` route
+  Behavior:
+  - if `command == "lock"`, calls `lock()`
+  - if `command == "off"`, calls `shutdown()`
+  - otherwise does nothing
+  Return:
+  - `None`
+
+- `lock()`
+  Input:
+  - none
+  Behavior:
+  - runs `xdg-screensaver lock`
+  Intended effect:
+  - lock the current desktop session
+  Return:
+  - `404` only when the subprocess call fails
+  Notes:
+  - the source comment says this works only on X11
+
+- `shutdown()`
+  Input:
+  - none
+  Behavior:
+  - terminates the process immediately using `os._exit(1)`
+  Return:
+  - `404` only if the exit call raises, which is unlikely
+  Notes:
+  - despite the name, it exits Carbon-Share; it does not power off the machine
+
+- `server_on()`
+  Input:
+  - none
+  Behavior:
+  - disables Flask and Werkzeug request logs
+  - starts the Flask app on:
+    - host `0.0.0.0`
+    - port `data.PORT`
+    - `use_reloader=False`
+    - `debug=True`
+  Side effects:
+  - binds the HTTP server socket
+
+- `init_server()`
+  Input:
+  - none
+  Behavior:
+  - calls `server_on()`
+  - if startup fails:
+    - logs the exception
+    - increases `data.PORT` by a random value between 10 and 900
+    - retries `server_on()`
+  Notes:
+  - this is the function started by `Share.py` in a daemon thread
+
+
+7. `Code/Share.py`
+------------------
+
+Purpose:
+Act as the runtime coordinator for the GTK UI and Flask server.
+
+Imports:
+
+- `time`
+  Used for the polling interval in IP monitoring.
+- `threading`
+  Used to run the server and IP monitor in background threads.
+- `server`
+  Flask server module.
+- `data`
+  Shared configuration and helpers.
+- `directShare`
+  GTK UI module.
+
+Class:
+
+- `App`
+  Coordinates startup and background tasks.
+
+Methods and attributes:
+
+- `__init__(self)`
+  Behavior:
+  - creates the GTK app instance
+  Attributes:
+  - `self.direct`
+    instance of `directShare.App`
+
+- `start(self)`
+  Behavior:
+  - starts `self.monitor_ip` in a daemon thread
+  - starts `server.init_server` in a daemon thread
+  - writes a success log using the current `data.url`
+  - enters the GTK main loop by calling `self.direct.run()`
+  Notes:
+  - the GTK loop keeps the process in the foreground
+  - the server and monitor threads stop automatically when the process exits because they are daemon threads
+
+- `monitor_ip(self)`
+  Purpose:
+  - continuously detect LAN IP changes
+  Loop behavior:
+  - calls `data.check()` every 2 seconds
+  - stores the result in `new_url`
+  - compares `new_url` with `data.previousIP`
+  - if different:
+    - updates `data.previousIP`
+    - updates `data.url`
+    - updates `data.url` again (duplicated assignment in current code)
+    - calls `self.direct.updateIP(new_url)`
+  Error handling:
+  - on any exception, logs `IP Monitor Error <exception>`
+  Side effects:
+  - shared global state mutation in `data`
+  - UI refresh through GTK idle callbacks
+
+Top-level execution:
+
+- `if __name__ == "__main__":`
+  Behavior:
+  - creates `app = App()`
+  - calls `app.start()`
+
+
+8. Variables summary by file
+----------------------------
+
+`Code/bridge.py`
+
+- `data_module`: imported `data` module object
+
+`Code/data.py`
+
+- `PORT`: port number for URL generation
+- `RED`, `GREEN`, `RESET`: ANSI color sequences
+- `NAME`: app name for logs
+- `path`: default starting directory
+- `name`: device hostname
+- `status`: unused boolean flag
+- `color`: QR background color
+- `password`: saved session value from `share.json`
+- `url`: current base URL
+- `previousIP`: last observed URL
+- `abouturl`: derived informational URL, unused
+
+`Code/directShare.py`
+
+- `data`: alias to shared data module
+- `self.main`: GTK window
+- `self.css`: inline CSS bytes
+- `self.image`: GTK image widget for QR code
+- `self.label`: GTK button showing the URL
+- local UI variables: `box`, `boxVertical`, `styler`
+- QR generation locals: `qr`, `img`, `buf`, `loader`
+
+`Code/server.py`
+
+- `data`: alias to shared data module
+- `password`: saved session value, currently unused
+- `server`: Flask app instance
+- `FILE_ICONS`: extension-to-icon lookup table
+- route locals such as `path`, `abs_path`, `dir`, `name`, `payload`, `text`, `files`, `dest`
+- helper locals such as `pata`, `nata`, `entries`, `output`, `entry`, `abs_entry`, `icon`, `parent`
+
+`Code/Share.py`
+
+- `self.direct`: GTK app instance
+- `new_url`: most recent URL produced by `data.check()`
+
+
+9. Known inconsistencies
+------------------------
+
+These are important for understanding the code as it exists now:
+
+- `Share.py` references `server.init_server`, but `server.py` as read here does not define it.
+- `data.addPAIR()` returns immediately and does nothing.
+- `data.savePass()` references `session` without importing it.
+- `get_files()` returns the string `"404"` on failure, while some callers compare with integer `404`.
+- `monitor_ip()` assigns `data.url = new_url` twice.
+
+Those issues do not prevent documenting the current logic, but they matter if you plan to make the app production-ready.
