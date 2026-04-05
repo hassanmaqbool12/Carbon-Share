@@ -291,7 +291,7 @@ def server_on():
     logging.getLogger('flask.app').disabled = True
 
     # INIT the server
-    server.run(host="0.0.0.0", port=data.PORT , use_reloader=False, debug=True)
+    server.run(host="0.0.0.0", port=data.PORT , use_reloader=False, debug=False)
 
 def init_server():
     try:

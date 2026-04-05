@@ -18,6 +18,12 @@ It focuses on:
 - each function and method
 - how data moves between modules
 
+Target use
+----------
+Carbon-Share is strictly designed for Linux desktop users on the same local network who want a lightweight browser-accessible sharing tool backed by the host machine's desktop environment and PAM authentication.
+
+For Debian- and Ubuntu-based systems, the repository also includes a packaged build as `Carbon-Share.deb`.
+
 
 1. High-level architecture
 --------------------------
@@ -48,16 +54,22 @@ Carbon-Share is split into three main layers:
 Startup flow:
 
 1. `Code/Share.py` is executed.
-2. `App.__init__()` creates `directShare.App()`.
-3. `App.start()` launches:
-   - `monitor_ip()` in a daemon thread
-   - `server.init_server` in a daemon thread
-4. The GTK app runs in the main thread.
+2. `App.__init__()` decides whether a graphical session exists by checking `DISPLAY` and `WAYLAND_DISPLAY`.
+3. If a UI is available:
+   - `directShare.App()` is created
+   - `monitor_ip()` runs in a daemon thread
+   - `server.init_server()` runs in a daemon thread
+   - the GTK app runs in the main thread
+4. If no UI is available:
+   - `monitor_ip()` still runs in a daemon thread
+   - the app logs that it is in headless mode
+   - `server.init_server()` runs in the foreground
 5. `data.url` is the canonical current share URL.
 6. When `monitor_ip()` sees a different URL, it:
    - updates `data.previousIP`
    - updates `data.url`
-   - tells the GTK app to redraw the label and QR code
+   - logs the new URL
+   - updates the GTK UI only when `self.direct` exists
 
 Request flow:
 
@@ -790,20 +802,23 @@ Methods and attributes:
 
 - `__init__(self)`
   Behavior:
-  - creates the GTK app instance
+  - initializes `self.direct` to `None`
+  - checks whether a graphical environment is available by calling `self.is_ui()`
+  - if UI is available:
+    - creates `directShare.App()`
+    - logs a stop hint
+    - starts `monitor_ip()` in a daemon thread
+    - starts `server.init_server()` in a daemon thread
+    - logs that the UI class is starting
+    - enters the GTK event loop with `self.direct.run()`
+  - if UI is not available:
+    - logs a stop hint
+    - starts `monitor_ip()` in a daemon thread
+    - logs that the app is running in headless mode
+    - starts `server.init_server()` in the foreground
   Attributes:
   - `self.direct`
-    instance of `directShare.App`
-
-- `start(self)`
-  Behavior:
-  - starts `self.monitor_ip` in a daemon thread
-  - starts `server.init_server` in a daemon thread
-  - writes a success log using the current `data.url`
-  - enters the GTK main loop by calling `self.direct.run()`
-  Notes:
-  - the GTK loop keeps the process in the foreground
-  - the server and monitor threads stop automatically when the process exits because they are daemon threads
+    either `None` or an instance of `directShare.App`
 
 - `monitor_ip(self)`
   Purpose:
@@ -816,19 +831,30 @@ Methods and attributes:
     - updates `data.previousIP`
     - updates `data.url`
     - updates `data.url` again (duplicated assignment in current code)
-    - calls `self.direct.updateIP(new_url)`
+    - logs the current URL
+    - calls `self.direct.updateIP(new_url)` only when `self.direct` exists
   Error handling:
   - on any exception, logs `IP Monitor Error <exception>`
   Side effects:
   - shared global state mutation in `data`
-  - UI refresh through GTK idle callbacks
+  - UI refresh through GTK idle callbacks when running with a display
+
+- `is_ui(self)`
+  Input:
+  - none
+  Behavior:
+  - checks whether either `DISPLAY` or `WAYLAND_DISPLAY` is present in the environment
+  Return:
+  - `True` if a graphical session is available
+  - `False` otherwise
 
 Top-level execution:
 
 - `if __name__ == "__main__":`
   Behavior:
   - creates `app = App()`
-  - calls `app.start()`
+  Notes:
+  - all startup behavior already occurs inside `App.__init__()`
 
 
 8. Variables summary by file
@@ -873,7 +899,7 @@ Top-level execution:
 
 `Code/Share.py`
 
-- `self.direct`: GTK app instance
+- `self.direct`: GTK app instance or `None` in headless mode
 - `new_url`: most recent URL produced by `data.check()`
 
 
@@ -882,10 +908,11 @@ Top-level execution:
 
 These are important for understanding the code as it exists now:
 
-- `Share.py` references `server.init_server`, but `server.py` as read here does not define it.
 - `data.addPAIR()` returns immediately and does nothing.
 - `data.savePass()` references `session` without importing it.
 - `get_files()` returns the string `"404"` on failure, while some callers compare with integer `404`.
 - `monitor_ip()` assigns `data.url = new_url` twice.
 
 Those issues do not prevent documenting the current logic, but they matter if you plan to make the app production-ready.
+
+This text is written by OpenAI Codex.

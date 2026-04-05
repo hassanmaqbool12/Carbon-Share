@@ -82,7 +82,6 @@ class App():
         self.label.connect('clicked', self.open_browser)
 
         self.main.add(box)
-        self.main.show_all()
 
     def on_key(self, widget, event):
         if event.type == Gdk.EventType.KEY_PRESS:
@@ -99,6 +98,7 @@ class App():
         return
 
     def run(self):
+        self.main.show_all()
         Gtk.main()
 
     def getQR(self, url):
